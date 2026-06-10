@@ -1,0 +1,23 @@
+plugins {
+    id "com.android.application"
+}
+
+android {
+    namespace "com.lynn.proxyvpn"
+    compileSdk 35
+
+    defaultConfig {
+        applicationId "com.lynn.proxyvpn"
+        minSdk 23
+        targetSdk 35
+        versionCode 7
+        versionName "0.1.6"
+    }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging true
+            keepDebugSymbols += ["**/libtun2socks.so"]
+        }
+    }
+}
