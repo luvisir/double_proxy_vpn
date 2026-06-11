@@ -11,12 +11,13 @@ import android.graphics.drawable.GradientDrawable;
 import android.net.VpnService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.text.Editable;
 import android.text.InputType;
 import android.text.TextWatcher;
 import android.view.Gravity;
 import android.view.View;
-import android.widget.AdapterView;
 import android.widget.ArrayAdapter;
 import android.widget.Button;
 import android.widget.EditText;
@@ -30,24 +31,34 @@ import java.util.List;
 
 public class MainActivity extends Activity {
     private static final int VPN_PERMISSION_REQUEST = 1001;
-    private Spinner profileInput;
     private Spinner protocolInput;
     private EditText nameInput;
     private EditText hostInput;
     private EditText portInput;
     private EditText usernameInput;
     private EditText passwordInput;
+    private Button editSaveButton;
     private Button startButton;
-    private Button stopButton;
+    private TextView connectionTimeText;
     private TextView statusText;
-    private ArrayAdapter<String> profileAdapter;
     private List<ProxyConfig> profiles = new ArrayList<>();
     private String currentProfileId = "profile_1";
     private String actualUsername = "";
     private String actualPassword = "";
-    private boolean loadingProfiles;
-    private boolean suppressProfileSelection;
     private boolean bindingSensitiveFields;
+    private boolean editing;
+    private boolean vpnRunning;
+    private long connectionStartedAtMillis;
+    private final Handler timerHandler = new Handler(Looper.getMainLooper());
+    private final Runnable timerRunnable = new Runnable() {
+        @Override
+        public void run() {
+            updateConnectionTime();
+            if (vpnRunning) {
+                timerHandler.postDelayed(this, 1000);
+            }
+        }
+    };
 
     private final BroadcastReceiver statusReceiver = new BroadcastReceiver() {
         @Override
@@ -56,9 +67,9 @@ public class MainActivity extends Activity {
                 String status = intent.getStringExtra(ProxyVpnService.EXTRA_STATUS);
                 statusText.setText(status);
                 if ("全局代理已启动".equals(status)) {
-                    updateButtonState(true);
+                    setVpnRunning(true);
                 } else if (status != null && (status.contains("启动失败") || status.contains("内核退出") || status.contains("停止"))) {
-                    updateButtonState(false);
+                    setVpnRunning(false);
                 }
             }
         }
@@ -70,6 +81,7 @@ public class MainActivity extends Activity {
         requestNotificationPermission();
         setContentView(buildLayout());
         loadProfiles();
+        syncVpnStateFromService();
     }
 
     @Override
@@ -81,12 +93,32 @@ public class MainActivity extends Activity {
         } else {
             registerReceiver(statusReceiver, filter);
         }
+        syncVpnStateFromService();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        syncVpnStateFromService();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        syncVpnStateFromService();
     }
 
     @Override
     protected void onStop() {
         super.onStop();
         unregisterReceiver(statusReceiver);
+    }
+
+    @Override
+    protected void onDestroy() {
+        super.onDestroy();
+        timerHandler.removeCallbacks(timerRunnable);
     }
 
     private View buildLayout() {
@@ -102,43 +134,22 @@ public class MainActivity extends Activity {
                 ScrollView.LayoutParams.MATCH_PARENT
         ));
 
+        LinearLayout header = new LinearLayout(this);
+        header.setOrientation(LinearLayout.HORIZONTAL);
+        header.setGravity(Gravity.CENTER_VERTICAL);
+
         TextView title = new TextView(this);
-        title.setText("Double Proxy");
+        title.setText("EProxy");
         title.setTextSize(28);
         title.setGravity(Gravity.START);
-        root.addView(title, matchWrap());
+        header.addView(title, weightWrap());
 
-        profileInput = new Spinner(this);
-        profileAdapter = new ArrayAdapter<>(this, android.R.layout.simple_spinner_item, new ArrayList<>());
-        profileAdapter.setDropDownViewResource(android.R.layout.simple_spinner_dropdown_item);
-        profileInput.setAdapter(profileAdapter);
-        profileInput.setOnItemSelectedListener(new AdapterView.OnItemSelectedListener() {
-            @Override
-            public void onItemSelected(AdapterView<?> parent, View view, int position, long id) {
-                if (loadingProfiles || suppressProfileSelection || position < 0 || position >= profiles.size()) {
-                    return;
-                }
-                ProxyConfig selected = profiles.get(position);
-                if (selected.id.equals(currentProfileId)) {
-                    return;
-                }
-                persistCurrentProfileWithoutRefresh();
-                showProfile(selected);
-            }
-
-            @Override
-            public void onNothingSelected(AdapterView<?> parent) {
-            }
-        });
-        root.addView(label("代理列表"));
-        root.addView(profileInput, matchWrap());
-
-        LinearLayout profileButtons = new LinearLayout(this);
-        profileButtons.setOrientation(LinearLayout.HORIZONTAL);
-        profileButtons.addView(button("新增", v -> addProfile()), weightWrap());
-        profileButtons.addView(button("保存", v -> saveCurrentProfile(true)), weightWrap());
-        profileButtons.addView(button("删除", v -> deleteCurrentProfile()), weightWrap());
-        root.addView(profileButtons, matchWrap());
+        editSaveButton = button("编辑", v -> toggleEditing());
+        header.addView(editSaveButton, new LinearLayout.LayoutParams(
+                LinearLayout.LayoutParams.WRAP_CONTENT,
+                LinearLayout.LayoutParams.WRAP_CONTENT
+        ));
+        root.addView(header, matchWrap());
 
         nameInput = field("名称", InputType.TYPE_CLASS_TEXT);
         root.addView(label("名称"));
@@ -171,11 +182,15 @@ public class MainActivity extends Activity {
 
         root.addView(button("测试连接", v -> testProxy()), matchWrap());
 
-        startButton = button("启动全局代理", v -> startVpn());
+        startButton = button("启动", v -> toggleVpn());
         root.addView(startButton, matchWrap());
 
-        stopButton = button("停止", v -> stopVpn());
-        root.addView(stopButton, matchWrap());
+        connectionTimeText = new TextView(this);
+        connectionTimeText.setText("连接时间 00:00:00");
+        connectionTimeText.setTextSize(17);
+        connectionTimeText.setGravity(Gravity.CENTER);
+        connectionTimeText.setPadding(0, 18, 0, 18);
+        root.addView(connectionTimeText, matchWrap());
 
         statusText = new TextView(this);
         statusText.setText("未连接");
@@ -183,7 +198,8 @@ public class MainActivity extends Activity {
         statusText.setPadding(0, 8, 0, 0);
         root.addView(statusText, matchWrap());
 
-        updateButtonState(false);
+        setEditing(false);
+        setVpnRunning(false);
 
         return scrollView;
     }
@@ -192,21 +208,13 @@ public class MainActivity extends Activity {
         profiles = ProxyConfig.loadProfiles(this);
         String selectedId = ProxyConfig.loadSelectedProfileId(this);
         int selectedIndex = 0;
-        suppressProfileSelection = true;
-        profileAdapter.clear();
         for (int i = 0; i < profiles.size(); i++) {
             ProxyConfig profile = profiles.get(i);
-            profileAdapter.add(profile.displayName());
             if (profile.id.equals(selectedId)) {
                 selectedIndex = i;
             }
         }
-        profileAdapter.notifyDataSetChanged();
 
-        loadingProfiles = true;
-        profileInput.setSelection(selectedIndex);
-        loadingProfiles = false;
-        suppressProfileSelection = false;
         showProfile(profiles.get(selectedIndex));
     }
 
@@ -226,40 +234,13 @@ public class MainActivity extends Activity {
         actualUsername = config.username == null ? "" : config.username;
         actualPassword = config.password == null ? "" : config.password;
         hideSensitiveFields(false);
-    }
-
-    private void addProfile() {
-        saveCurrentProfile(false);
-        ProxyConfig profile = ProxyConfig.blank("profile_" + System.currentTimeMillis(), profiles.size() + 1);
-        profiles.add(profile);
-        ProxyConfig.saveProfiles(this, profiles);
-        ProxyConfig.saveSelectedProfileId(this, profile.id);
-        loadProfiles();
-        statusText.setText("已新增代理");
-    }
-
-    private void deleteCurrentProfile() {
-        if (profiles.size() <= 1) {
-            statusText.setText("至少保留一个代理");
-            return;
-        }
-        for (int i = 0; i < profiles.size(); i++) {
-            if (profiles.get(i).id.equals(currentProfileId)) {
-                profiles.remove(i);
-                break;
-            }
-        }
-        ProxyConfig.saveProfiles(this, profiles);
-        ProxyConfig.saveSelectedProfileId(this, profiles.get(0).id);
-        loadProfiles();
-        statusText.setText("已删除代理");
+        setEditing(false);
     }
 
     private ProxyConfig saveCurrentProfile(boolean showStatus) {
         ProxyConfig config = currentConfig();
         ProxyConfig.saveProfile(this, config);
         replaceProfileInMemory(config);
-        refreshProfileNames();
         if (showStatus) {
             statusText.setText("已保存");
         }
@@ -282,24 +263,6 @@ public class MainActivity extends Activity {
             }
         }
         profiles.add(config);
-    }
-
-    private void refreshProfileNames() {
-        int selectedIndex = 0;
-        suppressProfileSelection = true;
-        profileAdapter.clear();
-        for (int i = 0; i < profiles.size(); i++) {
-            ProxyConfig profile = profiles.get(i);
-            profileAdapter.add(profile.displayName());
-            if (profile.id.equals(currentProfileId)) {
-                selectedIndex = i;
-            }
-        }
-        profileAdapter.notifyDataSetChanged();
-        loadingProfiles = true;
-        profileInput.setSelection(selectedIndex);
-        loadingProfiles = false;
-        suppressProfileSelection = false;
     }
 
     private EditText field(String hint, int inputType) {
@@ -424,15 +387,15 @@ public class MainActivity extends Activity {
     }
 
     private void updateButtonState(boolean running) {
-        if (startButton == null || stopButton == null) {
+        if (startButton == null) {
             return;
         }
         if (running) {
+            startButton.setText("停止");
             styleButton(startButton, "#16A34A", "#FFFFFF");
-            styleButton(stopButton, "#D1D5DB", "#111827");
         } else {
+            startButton.setText("启动");
             styleButton(startButton, "#D1D5DB", "#111827");
-            styleButton(stopButton, "#DC2626", "#FFFFFF");
         }
     }
 
@@ -459,6 +422,106 @@ public class MainActivity extends Activity {
         );
     }
 
+    private void toggleEditing() {
+        if (editing) {
+            saveCurrentProfile(true);
+            setEditing(false);
+        } else {
+            setEditing(true);
+        }
+    }
+
+    private void setEditing(boolean enabled) {
+        editing = enabled;
+        if (editSaveButton != null) {
+            editSaveButton.setText(enabled ? "保存" : "编辑");
+        }
+        setConfigFieldsEnabled(enabled);
+        if (!enabled) {
+            hideSensitiveFields(true);
+        }
+    }
+
+    private void setConfigFieldsEnabled(boolean enabled) {
+        if (nameInput != null) {
+            nameInput.setEnabled(enabled);
+        }
+        if (protocolInput != null) {
+            protocolInput.setEnabled(enabled);
+        }
+        if (hostInput != null) {
+            hostInput.setEnabled(enabled);
+        }
+        if (portInput != null) {
+            portInput.setEnabled(enabled);
+        }
+        if (usernameInput != null) {
+            usernameInput.setEnabled(enabled);
+        }
+        if (passwordInput != null) {
+            passwordInput.setEnabled(enabled);
+        }
+    }
+
+    private void toggleVpn() {
+        if (vpnRunning) {
+            stopVpn();
+        } else {
+            startVpn();
+        }
+    }
+
+    private void setVpnRunning(boolean running) {
+        setVpnRunning(running, running ? ProxyVpnService.getStartedAtMillis() : 0);
+    }
+
+    private void setVpnRunning(boolean running, long startedAt) {
+        vpnRunning = running;
+        updateButtonState(running);
+        if (running) {
+            startConnectionTimer(startedAt);
+        } else {
+            stopConnectionTimer();
+        }
+    }
+
+    private void startConnectionTimer(long startedAt) {
+        connectionStartedAtMillis = startedAt > 0 ? startedAt : System.currentTimeMillis();
+        timerHandler.removeCallbacks(timerRunnable);
+        updateConnectionTime();
+        timerHandler.postDelayed(timerRunnable, 1000);
+    }
+
+    private void syncVpnStateFromService() {
+        if (ProxyVpnService.isRunning()) {
+            setVpnRunning(true, ProxyVpnService.getStartedAtMillis());
+            if (statusText != null) {
+                statusText.setText("全局代理已启动");
+            }
+        } else {
+            setVpnRunning(false);
+        }
+    }
+
+    private void stopConnectionTimer() {
+        timerHandler.removeCallbacks(timerRunnable);
+        connectionStartedAtMillis = 0;
+        if (connectionTimeText != null) {
+            connectionTimeText.setText("连接时间 00:00:00");
+        }
+    }
+
+    private void updateConnectionTime() {
+        if (connectionTimeText == null || connectionStartedAtMillis <= 0) {
+            return;
+        }
+        long elapsedSeconds = Math.max(0, (System.currentTimeMillis() - connectionStartedAtMillis) / 1000);
+        long hours = elapsedSeconds / 3600;
+        long minutes = (elapsedSeconds % 3600) / 60;
+        long seconds = elapsedSeconds % 60;
+        connectionTimeText.setText(String.format("连接时间 %02d:%02d:%02d", hours, minutes, seconds));
+    }
+
     private ProxyConfig currentConfig() {
         captureSensitiveField(usernameInput, true);
         captureSensitiveField(passwordInput, false);
@@ -469,7 +532,7 @@ public class MainActivity extends Activity {
         }
         String name = nameInput.getText().toString().trim();
         if (name.isEmpty()) {
-            name = "代理 " + Math.max(1, profileInput.getSelectedItemPosition() + 1);
+            name = "代理 1";
         }
         return new ProxyConfig(
                 currentProfileId,
@@ -497,6 +560,7 @@ public class MainActivity extends Activity {
 
     private void startVpn() {
         ProxyConfig config = saveCurrentProfile(false);
+        setEditing(false);
         if (!config.isValid()) {
             statusText.setText("请先填写正确的代理地址和端口");
             return;
@@ -510,11 +574,18 @@ public class MainActivity extends Activity {
     }
 
     private void stopVpn() {
-        Intent intent = new Intent(this, ProxyVpnService.class);
-        intent.setAction(ProxyVpnService.ACTION_STOP);
-        startService(intent);
-        updateButtonState(false);
-        statusText.setText("已请求停止");
+        ProxyVpnService.requestStop(this);
+        setVpnRunning(false);
+        statusText.setText("已停止");
+        keepActivityVisibleAfterStop();
+    }
+
+    private void keepActivityVisibleAfterStop() {
+        timerHandler.postDelayed(() -> {
+            Intent intent = new Intent(this, MainActivity.class);
+            intent.addFlags(Intent.FLAG_ACTIVITY_REORDER_TO_FRONT | Intent.FLAG_ACTIVITY_SINGLE_TOP);
+            startActivity(intent);
+        }, 250);
     }
 
     private void startVpnService() {
@@ -525,7 +596,6 @@ public class MainActivity extends Activity {
         } else {
             startService(intent);
         }
-        updateButtonState(true);
         statusText.setText("正在启动全局代理...");
     }
 
